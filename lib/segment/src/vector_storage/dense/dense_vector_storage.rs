@@ -16,7 +16,7 @@ use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
-use crate::data_types::vectors::{VectorElementType, VectorRef};
+use crate::data_types::vectors::VectorRef;
 use crate::types::{Distance, VectorStorageDatatype};
 #[cfg(target_os = "linux")]
 use crate::vector_storage::common::get_async_scorer;
@@ -234,7 +234,7 @@ where
 
     fn update_from<'a>(
         &mut self,
-        other_vectors: &mut impl Iterator<Item = (Cow<'a, [VectorElementType]>, bool)>,
+        other_vectors: &mut impl Iterator<Item = (Cow<'a, [T]>, bool)>,
         stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         let dim = self.vector_dim();
@@ -246,10 +246,10 @@ where
         let mut deleted_ids = vec![];
         for (offset, (other_vector, other_deleted)) in other_vectors.enumerate() {
             check_process_stopped(stopped)?;
-            let vector = T::slice_from_float_cow(other_vector);
+            // Vectors are already in the storage's element type — write as-is.
             // Safety: T implements zerocopy::IntoBytes.
             #[expect(deprecated, reason = "legacy code")]
-            let raw_bites = unsafe { mmap::transmute_to_u8_slice(vector.as_ref()) };
+            let raw_bites = unsafe { mmap::transmute_to_u8_slice(other_vector.as_ref()) };
             vectors_file.write_all(raw_bites)?;
             end_index += 1;
 
@@ -422,6 +422,7 @@ mod tests {
     use crate::fixtures::payload_context_fixture::create_id_tracker_fixture;
     use crate::id_tracker::{IdTracker, IdTrackerRead};
     use crate::index::hnsw_index::point_scorer::{BatchFilteredSearcher, FilteredScorer};
+    use crate::segment_constructor::batched_reader::merge_from_single_source;
     use crate::types::{PointIdType, QuantizationConfig, ScalarQuantizationConfig};
     use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
     use crate::vector_storage::quantized::quantized_vectors::{
@@ -467,13 +468,7 @@ mod tests {
                     .insert_vector(2, points[2].as_slice().into(), &hw_counter)
                     .unwrap();
             }
-            let mut iter = (0..3).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, 3).unwrap();
         }
 
         assert_eq!(storage.total_vector_count(), 3);
@@ -495,13 +490,7 @@ mod tests {
                     .insert_vector(4, points[4].as_slice().into(), &hw_counter)
                     .unwrap();
             }
-            let mut iter = (0..2).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, 2).unwrap();
         }
 
         assert_eq!(storage.total_vector_count(), 5);
@@ -571,13 +560,8 @@ mod tests {
                         .unwrap();
                 });
             }
-            let mut iter = (0..points.len()).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, points.len() as PointOffsetType)
+                .unwrap();
         }
 
         assert_eq!(storage.total_vector_count(), 5);
@@ -701,13 +685,8 @@ mod tests {
                     }
                 });
             }
-            let mut iter = (0..points.len()).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, points.len() as PointOffsetType)
+                .unwrap();
         }
 
         assert_eq!(
@@ -772,13 +751,8 @@ mod tests {
                         .unwrap();
                 }
             }
-            let mut iter = (0..points.len()).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, points.len() as PointOffsetType)
+                .unwrap();
         }
 
         let vector = vec![-1.0, -1.0, -1.0, -1.0];
@@ -844,13 +818,8 @@ mod tests {
                         .unwrap();
                 }
             }
-            let mut iter = (0..points.len()).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, points.len() as PointOffsetType)
+                .unwrap();
         }
 
         let config: QuantizationConfig = ScalarQuantizationConfig {
