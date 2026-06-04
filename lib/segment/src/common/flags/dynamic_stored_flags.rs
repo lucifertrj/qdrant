@@ -3,12 +3,13 @@ use std::cmp::max;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use common::bitvec::BitSlice;
+use common::bitvec::{BitSlice, BitVec};
 use common::mmap::{AdviceSetting, create_and_ensure_length};
 use common::stored_bitslice::StoredBitSlice;
 use common::types::PointOffsetType;
 use common::universal_io::{
-    OpenOptions, Populate, StoredStruct, UniversalReadFileOps, UniversalWrite,
+    OpenOptions, Populate, StoredStruct, TypedStorage, UniversalRead, UniversalReadFileOps,
+    UniversalWrite,
 };
 use fs_err as fs;
 
@@ -306,6 +307,51 @@ where
     }
 }
 
+impl<S: UniversalRead> DynamicStoredFlags<S> {
+    /// Read-only load of the persisted flags into an owned [`BitVec`].
+    ///
+    /// Reads the same on-disk layout the writable [`Self::open`] maintains —
+    /// `status.dat` for the logical length and `flags_a.dat` for the bits — but
+    /// never creates, resizes or migrates files, threading every open through
+    /// `fs`. The bitvec is truncated to the logical length like
+    /// [`Self::get_bitslice`], dropping the power-of-two trailing capacity (see
+    /// [`file_size_for`]) so `count_ones` returns the true flag count.
+    ///
+    /// Read-only vector storages use this to materialize their owned `deleted`
+    /// bitvec instead of wrapping a writable [`BitvecFlags`][1].
+    ///
+    /// [1]: super::bitvec_flags::BitvecFlags
+    #[allow(dead_code)] // pending: read-only vector storages will materialize `deleted` via this
+    pub fn load_bitvec(fs: &S::Fs, directory: &Path) -> OperationResult<BitVec> {
+        let read_options = OpenOptions {
+            writeable: false,
+            need_sequential: false,
+            populate: Populate::No,
+            advice: AdviceSetting::Global,
+        };
+
+        // Authoritative logical flag count. The flags file is power-of-two
+        // padded, so its on-disk bitslice is longer than `len`.
+        let status = TypedStorage::<S, DynamicFlagsStatus>::open(
+            fs,
+            status_file(directory),
+            read_options,
+            Default::default(),
+        )?;
+        let len = status.read_whole()?.first().map_or(0, |status| status.len);
+
+        let flags_path = directory.join(FLAGS_FILE);
+        let flags = StoredBitSlice::<S>::open(fs, &flags_path, read_options, Default::default())?;
+        let bits = flags.read_all()?;
+        bits.get(..len).map(BitVec::from_bitslice).ok_or_else(|| {
+            OperationError::service_error(format!(
+                "Flags file {} holds fewer than {len} bits",
+                flags_path.display(),
+            ))
+        })
+    }
+}
+
 #[allow(clippy::default_constructed_unit_structs)]
 #[duplicate::duplicate_item(
     tests_mod       S               Fs              cfg_predicate;
@@ -406,5 +452,36 @@ mod tests_mod {
         assert_eq!(file_size_for(1024), 128);
         assert_eq!(file_size_for(1025), 256);
         assert_eq!(file_size_for(10000), 2048);
+    }
+
+    #[test]
+    fn test_load_bitvec_read_only() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let num_flags = 5003; // Prime number, not byte aligned
+        let mut rng = StdRng::seed_from_u64(42);
+        let random_flags: Vec<bool> = iter::repeat_with(|| rng.random()).take(num_flags).collect();
+
+        // Persist the flags through the writable storage, then flush.
+        {
+            let mut dynamic_flags =
+                DynamicStoredFlags::<S>::open(&Fs::default(), dir.path(), false).unwrap();
+            dynamic_flags.set_len(&Fs::default(), num_flags).unwrap();
+            random_flags
+                .iter()
+                .enumerate()
+                .filter(|(_, flag)| **flag)
+                .for_each(|(i, _)| assert!(!dynamic_flags.set(i, true).unwrap()));
+            dynamic_flags.flusher()().unwrap();
+        }
+
+        // Load read-only into an owned bitvec and compare bit-for-bit.
+        let bitvec = DynamicStoredFlags::<S>::load_bitvec(&Fs::default(), dir.path()).unwrap();
+        let expected: BitVec = random_flags.iter().copied().collect();
+
+        assert_eq!(bitvec, expected);
+        assert_eq!(
+            bitvec.count_ones(),
+            random_flags.iter().filter(|flag| **flag).count(),
+        );
     }
 }
