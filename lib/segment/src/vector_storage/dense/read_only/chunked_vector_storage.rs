@@ -1,12 +1,14 @@
 use std::path::Path;
 
 use common::bitvec::{BitSlice, BitVec};
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::generic_consts::AccessPattern;
 use common::mmap::AdviceSetting;
 use common::types::PointOffsetType;
 use common::universal_io::UniversalRead;
 
 use crate::common::flags::dynamic_stored_flags::DynamicStoredFlags;
+use crate::common::live_reload::LiveReload;
 use crate::common::operation_error::OperationResult;
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
@@ -27,6 +29,10 @@ pub struct ReadOnlyChunkedDenseVectorStorage<T: PrimitiveVectorElement, S: Unive
     deleted: BitVec,
     distance: Distance,
     deleted_count: usize,
+    /// Chunk-open settings retained so [`LiveReload`] can refresh the chunked
+    /// vectors with the same residency.
+    advice: AdviceSetting,
+    populate: bool,
 }
 
 impl<T: PrimitiveVectorElement, S: UniversalRead> ReadOnlyChunkedDenseVectorStorage<T, S> {
@@ -66,7 +72,41 @@ impl<T: PrimitiveVectorElement, S: UniversalRead> ReadOnlyChunkedDenseVectorStor
             deleted,
             distance,
             deleted_count,
+            advice,
+            populate,
         })
+    }
+}
+
+impl<T: PrimitiveVectorElement, S: UniversalRead> LiveReload
+    for ReadOnlyChunkedDenseVectorStorage<T, S>
+{
+    type Fs = S::Fs;
+
+    /// Refresh from disk: reload the chunked vectors (picking up appended
+    /// vectors and new chunks) and apply the authoritative `deleted_points` to
+    /// the in-memory deletion bitvec. Newly added points are served straight
+    /// from the refreshed chunks, so `new_points` is unused.
+    fn live_reload(
+        &mut self,
+        fs: &S::Fs,
+        deleted_points: &[PointOffsetType],
+        _new_points: &[PointOffsetType],
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.vectors.live_reload(fs, self.advice, self.populate)?;
+
+        for &point in deleted_points {
+            let index = point as usize;
+            if index >= self.deleted.len() {
+                self.deleted.resize(index + 1, false);
+            }
+            if !self.deleted.replace(index, true) {
+                self.deleted_count += 1;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -211,5 +251,89 @@ mod tests {
                 .unwrap();
             assert_eq!(got, vectors[id as usize], "vector {id} mismatch");
         }
+    }
+
+    /// A writer appends vectors and deletes a few; after `live_reload` the
+    /// read-only view reflects both.
+    #[test]
+    fn live_reload_picks_up_appends_and_deletions() {
+        const DIM: usize = 64;
+        let dir = Builder::new().prefix("ro_dense_reload").tempdir().unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        let hw = HardwareCounterCell::disposable();
+
+        let rand_vec = |rng: &mut StdRng| -> DenseVector {
+            std::iter::repeat_with(|| rng.random_range(-1.0..1.0))
+                .take(DIM)
+                .collect()
+        };
+        let first: Vec<DenseVector> = (0..200).map(|_| rand_vec(&mut rng)).collect();
+        let second: Vec<DenseVector> = (0..150).map(|_| rand_vec(&mut rng)).collect();
+
+        let mut writer = open_appendable_memmap_vector_storage_impl::<VectorElementType>(
+            dir.path(),
+            DIM,
+            Distance::Dot,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap();
+        for (id, vector) in first.iter().enumerate() {
+            writer
+                .insert_vector(id as PointOffsetType, VectorRef::from(vector), &hw)
+                .unwrap();
+        }
+        writer.flusher()().unwrap();
+
+        let mut reader = ReadOnlyChunkedDenseVectorStorage::<VectorElementType, MmapFile>::open(
+            &MmapFs,
+            dir.path(),
+            DIM,
+            Distance::Dot,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap();
+        assert_eq!(reader.total_vector_count(), first.len());
+
+        // Append new vectors and delete a few existing ones through the writer.
+        for (offset, vector) in second.iter().enumerate() {
+            writer
+                .insert_vector(
+                    (first.len() + offset) as PointOffsetType,
+                    VectorRef::from(vector),
+                    &hw,
+                )
+                .unwrap();
+        }
+        let deleted_ids: Vec<PointOffsetType> = vec![3, 50, 199];
+        for &id in &deleted_ids {
+            writer.delete_vector(id).unwrap();
+        }
+        writer.flusher()().unwrap();
+
+        let new_ids: Vec<PointOffsetType> = (first.len()..first.len() + second.len())
+            .map(|offset| offset as PointOffsetType)
+            .collect();
+        reader
+            .live_reload(&MmapFs, &deleted_ids, &new_ids, &hw)
+            .unwrap();
+
+        assert_eq!(reader.total_vector_count(), first.len() + second.len());
+        assert_eq!(reader.deleted_vector_count(), deleted_ids.len());
+
+        // The appended vector is now visible and correct.
+        let got: DenseVector = reader
+            .get_vector::<Random>(first.len() as PointOffsetType)
+            .to_owned()
+            .try_into()
+            .unwrap();
+        assert_eq!(got, second[0]);
+
+        // Deletions are reflected; untouched points stay live.
+        for &id in &deleted_ids {
+            assert!(reader.is_deleted_vector(id));
+        }
+        assert!(!reader.is_deleted_vector(0));
     }
 }
