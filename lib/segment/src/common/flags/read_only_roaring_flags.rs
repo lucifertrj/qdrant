@@ -164,9 +164,6 @@ impl<S: UniversalRead> LiveReload for ReadOnlyRoaringFlags<S> {
             // Possible optimization: If new_points is sorted, we should be able to use read_bit_range and iter_ones on top of it
             if self.storage.get_bit(u64::from(point))?.unwrap_or(false) {
                 self.bitmap.insert(point);
-            } else {
-                // Now false on disk: remove it, since the bitmap is patched, not rebuilt.
-                self.bitmap.remove(point);
             }
         }
 
