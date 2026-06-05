@@ -1,11 +1,13 @@
 use std::path::Path;
 
 use common::bitvec::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::generic_consts::AccessPattern;
 use common::mmap::{Advice, AdviceSetting};
 use common::types::PointOffsetType;
 use common::universal_io::UniversalRead;
 
+use crate::common::live_reload::LiveReload;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::vectors::{VectorElementType, VectorElementTypeByte, VectorElementTypeHalf};
@@ -328,6 +330,51 @@ impl<S: UniversalRead> VectorStorageRead for VectorStorageReadEnum<S> {
     }
 }
 
+impl<S: UniversalRead> LiveReload for VectorStorageReadEnum<S> {
+    type Fs = S::Fs;
+
+    fn live_reload(
+        &mut self,
+        fs: &S::Fs,
+        deleted_points: &[PointOffsetType],
+        new_points: &[PointOffsetType],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        match self {
+            // Immutable dense (mmap) live-reload is postponed: it requires
+            // threading the deleted flags through the read-only backend, which
+            // reworks the shared `ImmutableDenseVectors` storage. Tracked as the
+            // Dense* step of read-only vector-storage live-reload.
+            VectorStorageReadEnum::Dense(_)
+            | VectorStorageReadEnum::DenseByte(_)
+            | VectorStorageReadEnum::DenseHalf(_) => {
+                todo!("live_reload for immutable dense (mmap) storage is not yet implemented")
+            }
+            VectorStorageReadEnum::DenseChunked(s) => {
+                s.live_reload(fs, deleted_points, new_points, hw_counter)
+            }
+            VectorStorageReadEnum::DenseChunkedByte(s) => {
+                s.live_reload(fs, deleted_points, new_points, hw_counter)
+            }
+            VectorStorageReadEnum::DenseChunkedHalf(s) => {
+                s.live_reload(fs, deleted_points, new_points, hw_counter)
+            }
+            VectorStorageReadEnum::MultiDenseChunked(s) => {
+                s.live_reload(fs, deleted_points, new_points, hw_counter)
+            }
+            VectorStorageReadEnum::MultiDenseChunkedByte(s) => {
+                s.live_reload(fs, deleted_points, new_points, hw_counter)
+            }
+            VectorStorageReadEnum::MultiDenseChunkedHalf(s) => {
+                s.live_reload(fs, deleted_points, new_points, hw_counter)
+            }
+            VectorStorageReadEnum::Sparse(s) => {
+                s.live_reload(fs, deleted_points, new_points, hw_counter)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use common::counter::hardware_counter::HardwareCounterCell;
@@ -515,5 +562,66 @@ mod tests {
         let multi: TypedMultiDenseVectorRef<VectorElementType> =
             stored.as_vec_ref().try_into().unwrap();
         assert_eq!(multi.to_owned(), multis[5]);
+    }
+
+    /// The enum dispatches `live_reload` to the active (chunked) variant.
+    #[test]
+    fn live_reload_dispatches_to_active_variant() {
+        let dir = Builder::new().prefix("disp_reload").tempdir().unwrap();
+        let mut rng = StdRng::seed_from_u64(9);
+        let hw = HardwareCounterCell::disposable();
+        let first: Vec<DenseVector> = (0..200).map(|_| rand_vec(&mut rng)).collect();
+        let second: Vec<DenseVector> = (0..100).map(|_| rand_vec(&mut rng)).collect();
+
+        let mut writer = open_appendable_memmap_vector_storage_impl::<VectorElementType>(
+            dir.path(),
+            DIM,
+            Distance::Dot,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap();
+        for (id, vector) in first.iter().enumerate() {
+            writer
+                .insert_vector(id as PointOffsetType, VectorRef::from(vector), &hw)
+                .unwrap();
+        }
+        writer.flusher()().unwrap();
+
+        let mut storage = VectorStorageReadEnum::<MmapFile>::open(
+            &MmapFs,
+            &dense_config(VectorStorageType::ChunkedMmap, None),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(storage.total_vector_count(), first.len());
+
+        for (offset, vector) in second.iter().enumerate() {
+            writer
+                .insert_vector(
+                    (first.len() + offset) as PointOffsetType,
+                    VectorRef::from(vector),
+                    &hw,
+                )
+                .unwrap();
+        }
+        let deleted_ids: Vec<PointOffsetType> = vec![5, 100];
+        for &id in &deleted_ids {
+            writer.delete_vector(id).unwrap();
+        }
+        writer.flusher()().unwrap();
+
+        let new_ids: Vec<PointOffsetType> = (first.len()..first.len() + second.len())
+            .map(|offset| offset as PointOffsetType)
+            .collect();
+        storage
+            .live_reload(&MmapFs, &deleted_ids, &new_ids, &hw)
+            .unwrap();
+
+        assert_eq!(storage.total_vector_count(), first.len() + second.len());
+        assert_eq!(storage.deleted_vector_count(), deleted_ids.len());
+        for &id in &deleted_ids {
+            assert!(storage.is_deleted_vector(id));
+        }
     }
 }
