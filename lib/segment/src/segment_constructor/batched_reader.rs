@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::cmp::min;
-use std::iter::Iterator;
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 
@@ -11,7 +10,7 @@ use common::types::PointOffsetType;
 use sparse::common::sparse_vector::SparseVector;
 
 use crate::common::operation_error::{OperationError, OperationResult};
-use crate::data_types::named_vectors::{CowMultiVector, CowVector};
+use crate::data_types::named_vectors::CowMultiVector;
 use crate::data_types::vectors::{VectorElementType, VectorElementTypeByte, VectorElementTypeHalf};
 use crate::types::CompactExtendedPointId;
 use crate::vector_storage::{
@@ -19,10 +18,8 @@ use crate::vector_storage::{
     VectorStorageRead,
 };
 
-const BATCH_SIZE: usize = 256;
-
 /// Define location of the point source during segment construction.
-pub struct PointData {
+pub(crate) struct PointData {
     pub external_id: CompactExtendedPointId,
     /// [`CompactExtendedPointId`] is 17 bytes, we reduce
     /// `segment_index` to 3 bytes to avoid paddings and align nicely.
@@ -32,30 +29,194 @@ pub struct PointData {
     pub ordering: u64,
 }
 
+/// Append `points` (read from `sources`) into `target`, copying each vector in
+/// its native representation — no `f32` round-trip, no dequantization.
+///
+/// Every source must be the same vector kind and element type as `target` (the
+/// storage type is fixed by the collection config, so this holds within one
+/// merge); a source of a different kind/element type yields a service error.
+pub(crate) fn merge_from<'a>(
+    target: &mut VectorStorageEnum,
+    points: &'a [PointData],
+    sources: &'a [&'a VectorStorageEnum],
+    stopped: &AtomicBool,
+) -> OperationResult<Range<PointOffsetType>> {
+    match target {
+        VectorStorageEnum::DenseVolatile(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_f32);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        #[cfg(test)]
+        VectorStorageEnum::DenseVolatileByte(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_byte);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        #[cfg(test)]
+        VectorStorageEnum::DenseVolatileHalf(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_half);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::DenseMemmap(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_f32);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::DenseMemmapByte(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_byte);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::DenseMemmapHalf(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_half);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        #[cfg(target_os = "linux")]
+        VectorStorageEnum::DenseUring(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_f32);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        #[cfg(target_os = "linux")]
+        VectorStorageEnum::DenseUringByte(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_byte);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        #[cfg(target_os = "linux")]
+        VectorStorageEnum::DenseUringHalf(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_half);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::DenseAppendableMemmap(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_f32);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::DenseAppendableMemmapByte(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_byte);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::DenseAppendableMemmapHalf(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_half);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::SparseVolatile(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_sparse);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::SparseMmap(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_sparse);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::MultiDenseVolatile(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_multi_f32);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        #[cfg(test)]
+        VectorStorageEnum::MultiDenseVolatileByte(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_multi_byte);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        #[cfg(test)]
+        VectorStorageEnum::MultiDenseVolatileHalf(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_multi_half);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::MultiDenseAppendableMemmap(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_multi_f32);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::MultiDenseAppendableMemmapByte(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_multi_byte);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::MultiDenseAppendableMemmapHalf(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_multi_half);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::EmptyDense(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_dense_f32);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+        VectorStorageEnum::EmptySparse(target) => {
+            let mut reader = BatchedReader::new(points, sources, read_sparse);
+            let range = target.update_from(&mut reader, stopped);
+            reader.finish(range)
+        }
+    }
+}
+
+/// Test-only helper: merge `count` points (offsets `0..count`) from a single
+/// `source` storage into `target` via [`merge_from`].
+#[cfg(test)]
+pub(crate) fn merge_from_single_source(
+    target: &mut VectorStorageEnum,
+    source: &VectorStorageEnum,
+    count: PointOffsetType,
+) -> OperationResult<Range<PointOffsetType>> {
+    use crate::types::PointIdType;
+
+    let points: Vec<PointData> = (0..count)
+        .map(|internal_id| PointData {
+            external_id: CompactExtendedPointId::from(PointIdType::NumId(internal_id as u64)),
+            segment_index: U24::new_wrapped(0),
+            internal_id,
+            version: 0,
+            ordering: 0,
+        })
+        .collect();
+    let sources = [source];
+    merge_from(target, &points, &sources, &AtomicBool::default())
+}
+
+// --- internal merge machinery -------------------------------------------------
+
+const BATCH_SIZE: usize = 256;
+
 /// Reads a point's vector (in the native representation `V`) and its deleted
 /// flag from a source storage. One reader per kind/element-type — all source
 /// variants of that kind are accepted, so e.g. a volatile source can feed an
-/// mmap target without an f32 round-trip.
-type ReadFn<'a, V> = fn(&'a VectorStorageEnum, PointOffsetType) -> (V, bool);
+/// mmap target without an f32 round-trip. A source of the wrong kind/element
+/// type yields a service error.
+type ReadFn<'a, V> = fn(&'a VectorStorageEnum, PointOffsetType) -> OperationResult<(V, bool)>;
 
 /// Batched iterator over points to insert, reading each source vector in its
 /// **native** representation `V` — no `f32` round-trip.
 ///
 /// Reads `BATCH_SIZE` points into a buffer (grouped by source segment for read
-/// locality) and then iterates over them.
-pub struct BatchedReader<'a, V> {
+/// locality) and then iterates over them. A read error is captured in `error`
+/// and ends iteration; the caller retrieves it via [`BatchedReader::finish`].
+struct BatchedReader<'a, V> {
     points: &'a [PointData],
     sources: &'a [&'a VectorStorageEnum],
     read: ReadFn<'a, V>,
     buffer: Vec<Option<(V, bool)>>,
     seg_to_points_buffer: AHashMap<U24, Vec<(&'a PointData, usize)>>,
+    /// First read error encountered, if any. Set => iteration stops.
+    error: Option<OperationError>,
     /// Global position of the iterator.
     /// From 0 to `points.len()`.
     position: usize,
 }
 
 impl<'a, V> BatchedReader<'a, V> {
-    pub fn new(
+    fn new(
         points: &'a [PointData],
         sources: &'a [&'a VectorStorageEnum],
         read: ReadFn<'a, V>,
@@ -70,12 +231,14 @@ impl<'a, V> BatchedReader<'a, V> {
             read,
             buffer,
             seg_to_points_buffer: AHashMap::default(),
+            error: None,
             position: 0,
         }
     }
 
-    /// Fills the buffer with the next batch of points.
-    fn refill_buffer(&mut self) {
+    /// Fills the buffer with the next batch of points, stopping at the first
+    /// read error.
+    fn refill_buffer(&mut self) -> OperationResult<()> {
         let start_pos = self.position;
         let end_pos = min(self.position + BATCH_SIZE, self.points.len());
 
@@ -93,14 +256,24 @@ impl<'a, V> BatchedReader<'a, V> {
         for (segment_index, points) in self.seg_to_points_buffer.drain() {
             let source = self.sources[segment_index.get() as usize];
             for (point_data, offset_in_batch) in points {
-                self.buffer[offset_in_batch] = Some((self.read)(source, point_data.internal_id));
+                self.buffer[offset_in_batch] = Some((self.read)(source, point_data.internal_id)?);
             }
         }
+
+        Ok(())
     }
 
-    fn refill_buffer_if_needed(&mut self) {
-        if self.position.is_multiple_of(BATCH_SIZE) {
-            self.refill_buffer();
+    /// Combine `update_from`'s result with any error captured while reading.
+    ///
+    /// A read error makes the source iterator end early, so `update_from`
+    /// returns `Ok` with a partial range — this surfaces the real error.
+    fn finish(
+        self,
+        range: OperationResult<Range<PointOffsetType>>,
+    ) -> OperationResult<Range<PointOffsetType>> {
+        match self.error {
+            Some(error) => Err(error),
+            None => range,
         }
     }
 }
@@ -109,11 +282,16 @@ impl<'a, V> Iterator for BatchedReader<'a, V> {
     type Item = (V, bool);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.points.len() {
+        if self.error.is_some() || self.position >= self.points.len() {
             return None;
         }
 
-        self.refill_buffer_if_needed();
+        if self.position.is_multiple_of(BATCH_SIZE) {
+            if let Err(error) = self.refill_buffer() {
+                self.error = Some(error);
+                return None;
+            }
+        }
 
         let item = self.buffer[self.position % BATCH_SIZE]
             .take()
@@ -124,67 +302,14 @@ impl<'a, V> Iterator for BatchedReader<'a, V> {
     }
 }
 
-/// Vector kind and element type a storage merges as. Storages within one group
-/// are interchangeable on read (e.g. volatile vs mmap vs appendable), so a
-/// merge is only valid between storages of the same group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MergeGroup {
-    DenseF32,
-    DenseByte,
-    DenseHalf,
-    MultiF32,
-    MultiByte,
-    MultiHalf,
-    Sparse,
-}
-
-fn merge_group(storage: &VectorStorageEnum) -> MergeGroup {
-    match storage {
-        VectorStorageEnum::DenseVolatile(_) => MergeGroup::DenseF32,
-        #[cfg(test)]
-        VectorStorageEnum::DenseVolatileByte(_) => MergeGroup::DenseByte,
-        #[cfg(test)]
-        VectorStorageEnum::DenseVolatileHalf(_) => MergeGroup::DenseHalf,
-        VectorStorageEnum::DenseMemmap(_) => MergeGroup::DenseF32,
-        VectorStorageEnum::DenseMemmapByte(_) => MergeGroup::DenseByte,
-        VectorStorageEnum::DenseMemmapHalf(_) => MergeGroup::DenseHalf,
-
-        #[cfg(target_os = "linux")]
-        VectorStorageEnum::DenseUring(_) => MergeGroup::DenseF32,
-        #[cfg(target_os = "linux")]
-        VectorStorageEnum::DenseUringByte(_) => MergeGroup::DenseByte,
-        #[cfg(target_os = "linux")]
-        VectorStorageEnum::DenseUringHalf(_) => MergeGroup::DenseHalf,
-
-        VectorStorageEnum::DenseAppendableMemmap(_) => MergeGroup::DenseF32,
-        VectorStorageEnum::DenseAppendableMemmapByte(_) => MergeGroup::DenseByte,
-        VectorStorageEnum::DenseAppendableMemmapHalf(_) => MergeGroup::DenseHalf,
-        VectorStorageEnum::SparseVolatile(_) => MergeGroup::Sparse,
-        VectorStorageEnum::SparseMmap(_) => MergeGroup::Sparse,
-        VectorStorageEnum::MultiDenseVolatile(_) => MergeGroup::MultiF32,
-        #[cfg(test)]
-        VectorStorageEnum::MultiDenseVolatileByte(_) => MergeGroup::MultiByte,
-        #[cfg(test)]
-        VectorStorageEnum::MultiDenseVolatileHalf(_) => MergeGroup::MultiHalf,
-        VectorStorageEnum::MultiDenseAppendableMemmap(_) => MergeGroup::MultiF32,
-        VectorStorageEnum::MultiDenseAppendableMemmapByte(_) => MergeGroup::MultiByte,
-        VectorStorageEnum::MultiDenseAppendableMemmapHalf(_) => MergeGroup::MultiHalf,
-        VectorStorageEnum::EmptyDense(_) => MergeGroup::DenseF32,
-        VectorStorageEnum::EmptySparse(_) => MergeGroup::Sparse,
-    }
-}
-
-// Native source readers, one per (kind, element type). All variants of the
-// same kind/element type are accepted, since storage variants of one element
-// type are interchangeable on read (e.g. volatile vs mmap vs appendable).
-//
-// `merge_from` validates that every source matches the target's group up front,
-// so the catch-all arms below are unreachable.
+// Native source readers, one per (kind, element type). All variants of the same
+// kind/element type are accepted; a source of any other kind/element type is a
+// merge between incompatible storages and yields a service error.
 
 fn read_dense_f32(
     source: &VectorStorageEnum,
     key: PointOffsetType,
-) -> (Cow<'_, [VectorElementType]>, bool) {
+) -> OperationResult<(Cow<'_, [VectorElementType]>, bool)> {
     let deleted = source.is_deleted_vector(key);
     let vector = match source {
         VectorStorageEnum::DenseVolatile(v) => v.get_dense::<Sequential>(key),
@@ -204,27 +329,33 @@ fn read_dense_f32(
         | VectorStorageEnum::MultiDenseAppendableMemmapByte(_)
         | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_)
         | VectorStorageEnum::EmptySparse(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a f32 dense storage",
+            ));
         }
         #[cfg(test)]
         VectorStorageEnum::DenseVolatileByte(_)
         | VectorStorageEnum::DenseVolatileHalf(_)
         | VectorStorageEnum::MultiDenseVolatileByte(_)
         | VectorStorageEnum::MultiDenseVolatileHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a f32 dense storage",
+            ));
         }
         #[cfg(target_os = "linux")]
         VectorStorageEnum::DenseUringByte(_) | VectorStorageEnum::DenseUringHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a f32 dense storage",
+            ));
         }
     };
-    (vector, deleted)
+    Ok((vector, deleted))
 }
 
 fn read_dense_byte(
     source: &VectorStorageEnum,
     key: PointOffsetType,
-) -> (Cow<'_, [VectorElementTypeByte]>, bool) {
+) -> OperationResult<(Cow<'_, [VectorElementTypeByte]>, bool)> {
     let deleted = source.is_deleted_vector(key);
     let vector = match source {
         #[cfg(test)]
@@ -246,26 +377,32 @@ fn read_dense_byte(
         | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_)
         | VectorStorageEnum::EmptyDense(_)
         | VectorStorageEnum::EmptySparse(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a byte dense storage",
+            ));
         }
         #[cfg(test)]
         VectorStorageEnum::DenseVolatileHalf(_)
         | VectorStorageEnum::MultiDenseVolatileByte(_)
         | VectorStorageEnum::MultiDenseVolatileHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a byte dense storage",
+            ));
         }
         #[cfg(target_os = "linux")]
         VectorStorageEnum::DenseUring(_) | VectorStorageEnum::DenseUringHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a byte dense storage",
+            ));
         }
     };
-    (vector, deleted)
+    Ok((vector, deleted))
 }
 
 fn read_dense_half(
     source: &VectorStorageEnum,
     key: PointOffsetType,
-) -> (Cow<'_, [VectorElementTypeHalf]>, bool) {
+) -> OperationResult<(Cow<'_, [VectorElementTypeHalf]>, bool)> {
     let deleted = source.is_deleted_vector(key);
     let vector = match source {
         #[cfg(test)]
@@ -287,26 +424,32 @@ fn read_dense_half(
         | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_)
         | VectorStorageEnum::EmptyDense(_)
         | VectorStorageEnum::EmptySparse(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a half dense storage",
+            ));
         }
         #[cfg(test)]
         VectorStorageEnum::DenseVolatileByte(_)
         | VectorStorageEnum::MultiDenseVolatileByte(_)
         | VectorStorageEnum::MultiDenseVolatileHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a half dense storage",
+            ));
         }
         #[cfg(target_os = "linux")]
         VectorStorageEnum::DenseUring(_) | VectorStorageEnum::DenseUringByte(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a half dense storage",
+            ));
         }
     };
-    (vector, deleted)
+    Ok((vector, deleted))
 }
 
 fn read_multi_f32(
     source: &VectorStorageEnum,
     key: PointOffsetType,
-) -> (CowMultiVector<'_, VectorElementType>, bool) {
+) -> OperationResult<(CowMultiVector<'_, VectorElementType>, bool)> {
     let deleted = source.is_deleted_vector(key);
     let vector = match source {
         VectorStorageEnum::MultiDenseVolatile(v) => v.get_multi::<Sequential>(key),
@@ -324,29 +467,35 @@ fn read_multi_f32(
         | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_)
         | VectorStorageEnum::EmptyDense(_)
         | VectorStorageEnum::EmptySparse(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a f32 multi-dense storage",
+            ));
         }
         #[cfg(test)]
         VectorStorageEnum::DenseVolatileByte(_)
         | VectorStorageEnum::DenseVolatileHalf(_)
         | VectorStorageEnum::MultiDenseVolatileByte(_)
         | VectorStorageEnum::MultiDenseVolatileHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a f32 multi-dense storage",
+            ));
         }
         #[cfg(target_os = "linux")]
         VectorStorageEnum::DenseUring(_)
         | VectorStorageEnum::DenseUringByte(_)
         | VectorStorageEnum::DenseUringHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a f32 multi-dense storage",
+            ));
         }
     };
-    (vector, deleted)
+    Ok((vector, deleted))
 }
 
 fn read_multi_byte(
     source: &VectorStorageEnum,
     key: PointOffsetType,
-) -> (CowMultiVector<'_, VectorElementTypeByte>, bool) {
+) -> OperationResult<(CowMultiVector<'_, VectorElementTypeByte>, bool)> {
     let deleted = source.is_deleted_vector(key);
     let vector = match source {
         #[cfg(test)]
@@ -366,28 +515,34 @@ fn read_multi_byte(
         | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_)
         | VectorStorageEnum::EmptyDense(_)
         | VectorStorageEnum::EmptySparse(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a byte multi-dense storage",
+            ));
         }
         #[cfg(test)]
         VectorStorageEnum::DenseVolatileByte(_)
         | VectorStorageEnum::DenseVolatileHalf(_)
         | VectorStorageEnum::MultiDenseVolatileHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a byte multi-dense storage",
+            ));
         }
         #[cfg(target_os = "linux")]
         VectorStorageEnum::DenseUring(_)
         | VectorStorageEnum::DenseUringByte(_)
         | VectorStorageEnum::DenseUringHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a byte multi-dense storage",
+            ));
         }
     };
-    (vector, deleted)
+    Ok((vector, deleted))
 }
 
 fn read_multi_half(
     source: &VectorStorageEnum,
     key: PointOffsetType,
-) -> (CowMultiVector<'_, VectorElementTypeHalf>, bool) {
+) -> OperationResult<(CowMultiVector<'_, VectorElementTypeHalf>, bool)> {
     let deleted = source.is_deleted_vector(key);
     let vector = match source {
         #[cfg(test)]
@@ -407,181 +562,107 @@ fn read_multi_half(
         | VectorStorageEnum::MultiDenseAppendableMemmapByte(_)
         | VectorStorageEnum::EmptyDense(_)
         | VectorStorageEnum::EmptySparse(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a half multi-dense storage",
+            ));
         }
         #[cfg(test)]
         VectorStorageEnum::DenseVolatileByte(_)
         | VectorStorageEnum::DenseVolatileHalf(_)
         | VectorStorageEnum::MultiDenseVolatileByte(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a half multi-dense storage",
+            ));
         }
         #[cfg(target_os = "linux")]
         VectorStorageEnum::DenseUring(_)
         | VectorStorageEnum::DenseUringByte(_)
         | VectorStorageEnum::DenseUringHalf(_) => {
-            unreachable!("source group validated by merge_from")
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a half multi-dense storage",
+            ));
         }
     };
-    (vector, deleted)
+    Ok((vector, deleted))
 }
 
-fn read_sparse(source: &VectorStorageEnum, key: PointOffsetType) -> (Cow<'_, SparseVector>, bool) {
-    let deleted = source.is_deleted_vector(key);
-    // Sparse has no f32 round-trip to avoid, so reuse the generic read path.
-    let vector = match source.get_vector::<Sequential>(key) {
-        CowVector::Sparse(v) => v,
-        CowVector::Dense(_) | CowVector::MultiDense(_) => {
-            unreachable!("sparse vector storage returned a non-sparse vector")
-        }
-    };
-    (vector, deleted)
-}
-
-/// Append `points` (read from `sources`) into `target`, copying each vector in
-/// its native representation — no `f32` round-trip, no dequantization.
-///
-/// Every source must be the same vector kind and element type as `target`; the
-/// storage type is fixed by the collection config, so this always holds within
-/// one merge. A mismatch returns a service error.
-pub fn merge_from<'a>(
-    target: &mut VectorStorageEnum,
-    points: &'a [PointData],
-    sources: &'a [&'a VectorStorageEnum],
-    stopped: &AtomicBool,
-) -> OperationResult<Range<PointOffsetType>> {
-    // Validate up front that every source is the same kind/element type as the
-    // target, so the readers below can copy data natively without conversion.
-    let target_group = merge_group(target);
-    for (index, source) in sources.iter().enumerate() {
-        let source_group = merge_group(source);
-        if source_group != target_group {
-            return Err(OperationError::service_error(format!(
-                "Cannot merge vector storage: source #{index} is {source_group:?}, \
-                 but the target is {target_group:?}"
-            )));
-        }
-    }
-
-    match target {
-        VectorStorageEnum::DenseVolatile(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_f32),
-            stopped,
-        ),
-        #[cfg(test)]
-        VectorStorageEnum::DenseVolatileByte(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_byte),
-            stopped,
-        ),
-        #[cfg(test)]
-        VectorStorageEnum::DenseVolatileHalf(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_half),
-            stopped,
-        ),
-        VectorStorageEnum::DenseMemmap(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_f32),
-            stopped,
-        ),
-        VectorStorageEnum::DenseMemmapByte(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_byte),
-            stopped,
-        ),
-        VectorStorageEnum::DenseMemmapHalf(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_half),
-            stopped,
-        ),
-
-        #[cfg(target_os = "linux")]
-        VectorStorageEnum::DenseUring(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_f32),
-            stopped,
-        ),
-        #[cfg(target_os = "linux")]
-        VectorStorageEnum::DenseUringByte(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_byte),
-            stopped,
-        ),
-        #[cfg(target_os = "linux")]
-        VectorStorageEnum::DenseUringHalf(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_half),
-            stopped,
-        ),
-
-        VectorStorageEnum::DenseAppendableMemmap(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_f32),
-            stopped,
-        ),
-        VectorStorageEnum::DenseAppendableMemmapByte(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_byte),
-            stopped,
-        ),
-        VectorStorageEnum::DenseAppendableMemmapHalf(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_half),
-            stopped,
-        ),
-        VectorStorageEnum::SparseVolatile(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_sparse),
-            stopped,
-        ),
-        VectorStorageEnum::SparseMmap(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_sparse),
-            stopped,
-        ),
-        VectorStorageEnum::MultiDenseVolatile(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_multi_f32),
-            stopped,
-        ),
-        #[cfg(test)]
-        VectorStorageEnum::MultiDenseVolatileByte(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_multi_byte),
-            stopped,
-        ),
-        #[cfg(test)]
-        VectorStorageEnum::MultiDenseVolatileHalf(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_multi_half),
-            stopped,
-        ),
-        VectorStorageEnum::MultiDenseAppendableMemmap(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_multi_f32),
-            stopped,
-        ),
-        VectorStorageEnum::MultiDenseAppendableMemmapByte(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_multi_byte),
-            stopped,
-        ),
-        VectorStorageEnum::MultiDenseAppendableMemmapHalf(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_multi_half),
-            stopped,
-        ),
-        VectorStorageEnum::EmptyDense(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_dense_f32),
-            stopped,
-        ),
-        VectorStorageEnum::EmptySparse(target) => target.update_from(
-            &mut BatchedReader::new(points, sources, read_sparse),
-            stopped,
-        ),
-    }
-}
-
-/// Test-only helper: merge `count` points (offsets `0..count`) from a single
-/// `source` storage into `target` via [`merge_from`].
-#[cfg(test)]
-pub fn merge_from_single_source(
-    target: &mut VectorStorageEnum,
+fn read_sparse(
     source: &VectorStorageEnum,
-    count: PointOffsetType,
-) -> OperationResult<Range<PointOffsetType>> {
-    use crate::types::PointIdType;
+    key: PointOffsetType,
+) -> OperationResult<(Cow<'_, SparseVector>, bool)> {
+    let deleted = source.is_deleted_vector(key);
+    let vector = match source {
+        // A deleted/absent vector reads as `None`; the placeholder is fine
+        // since the deleted flag is carried separately. Real read errors
+        // propagate via `?`.
+        VectorStorageEnum::SparseVolatile(v) => v
+            .get_sparse_opt::<Sequential>(key)?
+            .map(Cow::Owned)
+            .unwrap_or_default(),
+        VectorStorageEnum::SparseMmap(v) => v
+            .get_sparse_opt::<Sequential>(key)?
+            .map(Cow::Owned)
+            .unwrap_or_default(),
+        VectorStorageEnum::EmptySparse(v) => v
+            .get_sparse_opt::<Sequential>(key)?
+            .map(Cow::Owned)
+            .unwrap_or_default(),
+        VectorStorageEnum::DenseVolatile(_)
+        | VectorStorageEnum::DenseMemmap(_)
+        | VectorStorageEnum::DenseMemmapByte(_)
+        | VectorStorageEnum::DenseMemmapHalf(_)
+        | VectorStorageEnum::DenseAppendableMemmap(_)
+        | VectorStorageEnum::DenseAppendableMemmapByte(_)
+        | VectorStorageEnum::DenseAppendableMemmapHalf(_)
+        | VectorStorageEnum::MultiDenseVolatile(_)
+        | VectorStorageEnum::MultiDenseAppendableMemmap(_)
+        | VectorStorageEnum::MultiDenseAppendableMemmapByte(_)
+        | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_)
+        | VectorStorageEnum::EmptyDense(_) => {
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a sparse storage",
+            ));
+        }
+        #[cfg(test)]
+        VectorStorageEnum::DenseVolatileByte(_)
+        | VectorStorageEnum::DenseVolatileHalf(_)
+        | VectorStorageEnum::MultiDenseVolatileByte(_)
+        | VectorStorageEnum::MultiDenseVolatileHalf(_) => {
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a sparse storage",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        VectorStorageEnum::DenseUring(_)
+        | VectorStorageEnum::DenseUringByte(_)
+        | VectorStorageEnum::DenseUringHalf(_) => {
+            return Err(OperationError::service_error(
+                "Cannot merge vector storage: source is not a sparse storage",
+            ));
+        }
+    };
+    Ok((vector, deleted))
+}
 
-    let points: Vec<PointData> = (0..count)
-        .map(|internal_id| PointData {
-            external_id: CompactExtendedPointId::from(PointIdType::NumId(internal_id as u64)),
-            segment_index: U24::new_wrapped(0),
-            internal_id,
-            version: 0,
-            ordering: 0,
-        })
-        .collect();
-    let sources = [source];
-    merge_from(target, &points, &sources, &AtomicBool::default())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Distance;
+    use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
+    use crate::vector_storage::sparse::volatile_sparse_vector_storage::new_volatile_sparse_vector_storage;
+
+    /// Merging storages of different kinds (here sparse into dense) is rejected
+    /// with a service error rather than panicking.
+    #[test]
+    fn merge_rejects_incompatible_storage_kinds() {
+        let mut dense_target = new_volatile_dense_vector_storage(4, Distance::Dot);
+        let sparse_source = new_volatile_sparse_vector_storage();
+
+        let result = merge_from_single_source(&mut dense_target, &sparse_source, 1);
+
+        assert!(
+            result.is_err(),
+            "merging a sparse source into a dense target must error, got {result:?}"
+        );
+    }
 }
