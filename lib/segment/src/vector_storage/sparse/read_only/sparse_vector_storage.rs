@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use common::bitvec::{BitSlice, BitVec};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::generic_consts::AccessPattern;
@@ -6,11 +8,13 @@ use common::universal_io::UniversalRead;
 use gridstore::GridstoreReader;
 use sparse::common::sparse_vector::SparseVector;
 
-use crate::common::operation_error::OperationResult;
+use crate::common::flags::dynamic_stored_flags::DynamicStoredFlags;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::named_vectors::CowVector;
 use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::VectorStorageRead;
 use crate::vector_storage::sparse::SPARSE_VECTOR_DISTANCE;
+use crate::vector_storage::sparse::mmap_sparse_vector_storage::{DELETED_DIRNAME, STORAGE_DIRNAME};
 use crate::vector_storage::sparse::stored_sparse_vectors::StoredSparseVector;
 
 #[derive(Debug)]
@@ -23,6 +27,45 @@ pub struct ReadOnlySparseVectorStorage<S: UniversalRead> {
     deleted: BitVec,
     deleted_count: usize,
     next_point_offset: usize,
+}
+
+impl<S: UniversalRead> ReadOnlySparseVectorStorage<S> {
+    /// Open the read-only counterpart of [`MmapSparseVectorStorage`][1] at
+    /// `path`, threading every file open through `fs`.
+    ///
+    /// Reads the same on-disk layout the writable storage maintains — the
+    /// Gridstore `store/` directory and the `deleted/` flags — but never creates
+    /// or writes anything. The deleted flags are materialized into an owned
+    /// bitvec via [`DynamicStoredFlags::load_bitvec`], and `next_point_offset`
+    /// is reconstructed the same way the writable storage does on reopen: the
+    /// highest deleted id or the Gridstore pointer count, whichever is larger.
+    ///
+    /// [1]: super::super::mmap_sparse_vector_storage::MmapSparseVectorStorage
+    #[allow(dead_code)] // pending: read-only vector storage enum will use this
+    pub fn open(fs: &S::Fs, path: &Path) -> OperationResult<Self> {
+        let storage =
+            GridstoreReader::<StoredSparseVector, S>::open(fs, path.join(STORAGE_DIRNAME))
+                .map_err(|err| {
+                    OperationError::service_error(format!(
+                        "Failed to open read-only sparse vector storage: {err}"
+                    ))
+                })?;
+
+        let deleted = DynamicStoredFlags::<S>::load_bitvec(fs, &path.join(DELETED_DIRNAME))?;
+        let deleted_count = deleted.count_ones();
+
+        let next_point_offset = deleted
+            .last_one()
+            .max(Some(storage.max_point_offset() as usize))
+            .unwrap_or_default();
+
+        Ok(Self {
+            storage,
+            deleted,
+            deleted_count,
+            next_point_offset,
+        })
+    }
 }
 
 impl<S: UniversalRead> VectorStorageRead for ReadOnlySparseVectorStorage<S> {
@@ -91,5 +134,80 @@ impl<S: UniversalRead> VectorStorageRead for ReadOnlySparseVectorStorage<S> {
 
     fn deleted_vector_bitslice(&self) -> &BitSlice {
         self.deleted.as_bitslice()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::generic_consts::Random;
+    use common::universal_io::{MmapFile, MmapFs};
+    use tempfile::Builder;
+
+    use super::*;
+    use crate::data_types::vectors::VectorRef;
+    use crate::vector_storage::VectorStorage;
+    use crate::vector_storage::sparse::mmap_sparse_vector_storage::MmapSparseVectorStorage;
+
+    /// Write sparse vectors (deleting some) through the writable mmap storage,
+    /// then reopen the same directory read-only and assert it mirrors the state,
+    /// including per-point sparse contents and the reconstructed point count.
+    #[test]
+    fn read_only_sparse_round_trip() {
+        const POINT_COUNT: PointOffsetType = 500;
+
+        let dir = Builder::new().prefix("ro_sparse").tempdir().unwrap();
+        let hw = HardwareCounterCell::disposable();
+
+        let sparse_vectors: Vec<SparseVector> = (0..POINT_COUNT)
+            .map(|id| {
+                let value = id as f32;
+                SparseVector {
+                    indices: vec![1, 5, 9],
+                    values: vec![value + 0.1, value + 0.2, value + 0.3],
+                }
+            })
+            .collect();
+
+        let mut deleted_ids = Vec::new();
+        {
+            let mut storage = MmapSparseVectorStorage::open_or_create(dir.path()).unwrap();
+            for (id, vector) in sparse_vectors.iter().enumerate() {
+                storage
+                    .insert_vector(id as PointOffsetType, VectorRef::from(vector), &hw)
+                    .unwrap();
+            }
+            for id in (0..POINT_COUNT).step_by(7) {
+                storage.delete_vector(id).unwrap();
+                deleted_ids.push(id);
+            }
+            storage.flusher()().unwrap();
+        }
+
+        let storage = ReadOnlySparseVectorStorage::<MmapFile>::open(&MmapFs, dir.path()).unwrap();
+
+        assert_eq!(storage.total_vector_count(), POINT_COUNT as usize);
+        assert_eq!(storage.distance(), SPARSE_VECTOR_DISTANCE);
+        assert_eq!(storage.deleted_vector_count(), deleted_ids.len());
+
+        for id in 0..POINT_COUNT {
+            let deleted = deleted_ids.contains(&id);
+            assert_eq!(storage.is_deleted_vector(id), deleted);
+
+            // Deleting a sparse vector reclaims its Gridstore entry, so only
+            // live points still carry their contents.
+            if deleted {
+                continue;
+            }
+
+            match storage.get_vector::<Random>(id) {
+                CowVector::Sparse(got) => {
+                    assert_eq!(got.indices, sparse_vectors[id as usize].indices);
+                    assert_eq!(got.values, sparse_vectors[id as usize].values);
+                }
+                CowVector::Dense(_) | CowVector::MultiDense(_) => {
+                    panic!("expected sparse vector for point {id}")
+                }
+            }
+        }
     }
 }
