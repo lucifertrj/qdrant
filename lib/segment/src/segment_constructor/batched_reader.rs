@@ -174,7 +174,7 @@ pub(crate) fn merge_from_single_source(
 
     let points: Vec<PointData> = (0..count)
         .map(|internal_id| PointData {
-            external_id: CompactExtendedPointId::from(PointIdType::NumId(internal_id as u64)),
+            external_id: CompactExtendedPointId::from(PointIdType::NumId(u64::from(internal_id))),
             segment_index: U24::new_wrapped(0),
             internal_id,
             version: 0,
@@ -286,11 +286,11 @@ impl<'a, V> Iterator for BatchedReader<'a, V> {
             return None;
         }
 
-        if self.position.is_multiple_of(BATCH_SIZE) {
-            if let Err(error) = self.refill_buffer() {
-                self.error = Some(error);
-                return None;
-            }
+        if self.position.is_multiple_of(BATCH_SIZE)
+            && let Err(error) = self.refill_buffer()
+        {
+            self.error = Some(error);
+            return None;
         }
 
         let item = self.buffer[self.position % BATCH_SIZE]
