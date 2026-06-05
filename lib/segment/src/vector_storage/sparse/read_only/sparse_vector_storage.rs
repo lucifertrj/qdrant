@@ -9,6 +9,7 @@ use gridstore::GridstoreReader;
 use sparse::common::sparse_vector::SparseVector;
 
 use crate::common::flags::dynamic_stored_flags::DynamicStoredFlags;
+use crate::common::live_reload::LiveReload;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::named_vectors::CowVector;
 use crate::types::{Distance, VectorStorageDatatype};
@@ -65,6 +66,43 @@ impl<S: UniversalRead> ReadOnlySparseVectorStorage<S> {
             deleted_count,
             next_point_offset,
         })
+    }
+}
+
+impl<S: UniversalRead> LiveReload for ReadOnlySparseVectorStorage<S> {
+    type Fs = S::Fs;
+
+    /// Refresh from disk: reload the Gridstore (picking up appended vectors),
+    /// apply the authoritative `deleted_points` to the deletion bitvec, and
+    /// recompute `next_point_offset` the same way [`Self::open`] does. Newly
+    /// added points are served straight from the refreshed Gridstore, so
+    /// `new_points` is unused.
+    fn live_reload(
+        &mut self,
+        fs: &S::Fs,
+        deleted_points: &[PointOffsetType],
+        _new_points: &[PointOffsetType],
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.storage.live_reload(fs)?;
+
+        for &point in deleted_points {
+            let index = point as usize;
+            if index >= self.deleted.len() {
+                self.deleted.resize(index + 1, false);
+            }
+            if !self.deleted.replace(index, true) {
+                self.deleted_count += 1;
+            }
+        }
+
+        self.next_point_offset = self
+            .deleted
+            .last_one()
+            .max(Some(self.storage.max_point_offset() as usize))
+            .unwrap_or_default();
+
+        Ok(())
     }
 }
 
@@ -209,5 +247,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A writer appends sparse vectors and deletes a few; after `live_reload`
+    /// the read-only view reflects both.
+    #[test]
+    fn live_reload_picks_up_appends_and_deletions() {
+        let dir = Builder::new().prefix("ro_sparse_reload").tempdir().unwrap();
+        let hw = HardwareCounterCell::disposable();
+
+        fn make(id: usize) -> SparseVector {
+            SparseVector {
+                indices: vec![1, 5, 9],
+                values: vec![id as f32 + 0.1, id as f32 + 0.2, id as f32 + 0.3],
+            }
+        }
+        let first: Vec<SparseVector> = (0..150).map(make).collect();
+        let second: Vec<SparseVector> = (150..250).map(make).collect();
+
+        let mut writer = MmapSparseVectorStorage::open_or_create(dir.path()).unwrap();
+        for (id, vector) in first.iter().enumerate() {
+            writer
+                .insert_vector(id as PointOffsetType, VectorRef::from(vector), &hw)
+                .unwrap();
+        }
+        writer.flusher()().unwrap();
+
+        let mut reader =
+            ReadOnlySparseVectorStorage::<MmapFile>::open(&MmapFs, dir.path()).unwrap();
+        assert_eq!(reader.total_vector_count(), first.len());
+
+        for (offset, vector) in second.iter().enumerate() {
+            writer
+                .insert_vector(
+                    (first.len() + offset) as PointOffsetType,
+                    VectorRef::from(vector),
+                    &hw,
+                )
+                .unwrap();
+        }
+        let deleted_ids: Vec<PointOffsetType> = vec![2, 80, 149];
+        for &id in &deleted_ids {
+            writer.delete_vector(id).unwrap();
+        }
+        writer.flusher()().unwrap();
+
+        let new_ids: Vec<PointOffsetType> = (first.len()..first.len() + second.len())
+            .map(|offset| offset as PointOffsetType)
+            .collect();
+        reader
+            .live_reload(&MmapFs, &deleted_ids, &new_ids, &hw)
+            .unwrap();
+
+        assert_eq!(reader.total_vector_count(), first.len() + second.len());
+        assert_eq!(reader.deleted_vector_count(), deleted_ids.len());
+
+        // The appended vector is visible; deleted ones are flagged.
+        match reader.get_vector::<Random>(first.len() as PointOffsetType) {
+            CowVector::Sparse(got) => assert_eq!(got.values, second[0].values),
+            CowVector::Dense(_) | CowVector::MultiDense(_) => panic!("expected sparse vector"),
+        }
+        for &id in &deleted_ids {
+            assert!(reader.is_deleted_vector(id));
+        }
+        assert!(!reader.is_deleted_vector(0));
     }
 }
