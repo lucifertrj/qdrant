@@ -26,7 +26,7 @@ pub struct FeatureFlags {
 
     /// Use single-file mmap in-ram vector storage (InRamMmap)
     ///
-    /// Enabled by default in Qdrant 1.17.1+
+    /// Enabled by default in Qdrant 1.18.2+
     pub single_file_mmap_vector_storage: bool,
 }
 
@@ -36,7 +36,7 @@ impl Default for FeatureFlags {
             all: false,
             incremental_hnsw_building: true,
             appendable_quantization: true,
-            single_file_mmap_vector_storage: false,
+            single_file_mmap_vector_storage: true,
         }
     }
 }
